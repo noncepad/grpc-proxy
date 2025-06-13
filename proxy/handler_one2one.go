@@ -25,7 +25,7 @@ func (s *handler) handlerOne2One(serverStream grpc.ServerStream, backendConnecti
 	s2cErrChan := s.forwardServerToClient(serverStream, &backendConnections[0])
 	c2sErrChan := s.forwardClientToServer(&backendConnections[0], serverStream)
 	// We don't know which side is going to stop sending first, so we need a select between the two.
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		select {
 		case s2cErr := <-s2cErrChan:
 			if errors.Is(s2cErr, io.EOF) {
@@ -60,34 +60,32 @@ func (s *handler) forwardClientToServer(src *backendConnection, dst grpc.ServerS
 	ret := make(chan error, 1)
 
 	go func() {
+		// Send the header metadata first
+		md, err := src.clientStream.Header()
+		if err != nil {
+			ret <- err
+
+			return
+		}
+
+		if md != nil {
+			if err = dst.SendHeader(md); err != nil {
+				ret <- err
+
+				return
+			}
+		}
+
 		f := NewFrame(nil)
 
-		for i := 0; ; i++ {
-			if err := src.clientStream.RecvMsg(f); err != nil {
+		for {
+			if err = src.clientStream.RecvMsg(f); err != nil {
 				ret <- err // this can be io.EOF which is happy case
 
 				break
 			}
 
-			if i == 0 {
-				// This is a bit of a hack, but client to server headers are only readable after first client msg is
-				// received but must be written to server stream before the first msg is flushed.
-				// This is the only place to do it nicely.
-				md, err := src.clientStream.Header()
-				if err != nil {
-					ret <- err
-
-					break
-				}
-
-				if err := dst.SendHeader(md); err != nil {
-					ret <- err
-
-					break
-				}
-			}
-
-			if err := dst.SendMsg(f); err != nil {
+			if err = dst.SendMsg(f); err != nil {
 				ret <- err
 
 				break

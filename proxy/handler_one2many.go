@@ -29,7 +29,7 @@ func (s *handler) handlerOne2Many(fullMethodName string, serverStream grpc.Serve
 		c2sErrChan = s.forwardClientsToServerMultiUnary(backendConnections, serverStream)
 	}
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		select {
 		case s2cErr := <-s2cErrChan:
 			if errors.Is(s2cErr, io.EOF) {
@@ -109,7 +109,7 @@ func (s *handler) forwardClientsToServerMultiUnary(sources []backendConnection, 
 	payloadCh := make(chan []byte, len(sources))
 	errCh := make(chan error, len(sources))
 
-	for i := 0; i < len(sources); i++ {
+	for i := range sources {
 		go func(src *backendConnection) {
 			errCh <- func() error {
 				if src.connError != nil {
@@ -123,9 +123,30 @@ func (s *handler) forwardClientsToServerMultiUnary(sources []backendConnection, 
 					return nil
 				}
 
+				// Send the header metadata first
+				md, err := src.clientStream.Header()
+				if err != nil {
+					var payload []byte
+
+					payload, err = s.formatError(false, src, err)
+					if err != nil {
+						return err
+					}
+
+					payloadCh <- payload
+
+					return nil
+				}
+
+				if md != nil {
+					if err = dst.SetHeader(md); err != nil {
+						return fmt.Errorf("error setting headers from client %s: %w", src.backend, err)
+					}
+				}
+
 				f := &Frame{}
 
-				for j := 0; ; j++ {
+				for {
 					if err := src.clientStream.RecvMsg(f); err != nil {
 						if errors.Is(err, io.EOF) {
 							// This happens when the clientStream has nothing else to offer (io.EOF), returned a gRPC error. In those two
@@ -146,29 +167,6 @@ func (s *handler) forwardClientsToServerMultiUnary(sources []backendConnection, 
 						payloadCh <- payload
 
 						return nil
-					}
-
-					if j == 0 {
-						// This is a bit of a hack, but client to server headers are only readable after first client msg is
-						// received but must be written to server stream before the first msg is flushed.
-						// This is the only place to do it nicely.
-						md, err := src.clientStream.Header()
-						if err != nil {
-							var payload []byte
-
-							payload, err = s.formatError(false, src, err)
-							if err != nil {
-								return err
-							}
-
-							payloadCh <- payload
-
-							return nil
-						}
-
-						if err := dst.SetHeader(md); err != nil {
-							return fmt.Errorf("error setting headers from client %s: %w", src.backend, err)
-						}
 					}
 
 					var err error

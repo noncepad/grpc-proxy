@@ -9,12 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -80,7 +78,7 @@ func (s *assertingMultiService) Ping(ctx context.Context, ping *pb.PingRequest) 
 	}, nil
 }
 
-func (s *assertingMultiService) PingError(ctx context.Context, ping *pb.PingRequest) (*pb.EmptyReply, error) {
+func (s *assertingMultiService) PingError(context.Context, *pb.PingRequest) (*pb.EmptyReply, error) {
 	return nil, status.Errorf(codes.FailedPrecondition, "Userspace error.")
 }
 
@@ -88,7 +86,7 @@ func (s *assertingMultiService) PingList(ping *pb.PingRequest, stream pb.MultiSe
 	// Send user trailers and headers.
 	stream.SendHeader(metadata.Pairs(serverHeaderMdKey, "I like turtles.")) //nolint: errcheck
 
-	for i := 0; i < countListResponses; i++ {
+	for i := range countListResponses {
 		stream.Send(&pb.MultiPingResponse{ //nolint: errcheck
 			Value:   ping.Value,
 			Counter: int32(i),
@@ -135,43 +133,29 @@ func (s *assertingMultiService) PingStream(stream pb.MultiService_PingStreamServ
 	return nil
 }
 
-func (s *assertingMultiService) PingStreamError(stream pb.MultiService_PingStreamErrorServer) error {
+func (s *assertingMultiService) PingStreamError(pb.MultiService_PingStreamErrorServer) error {
 	return status.Errorf(codes.FailedPrecondition, "Userspace error.")
 }
 
 type assertingBackend struct {
 	conn *grpc.ClientConn
-
-	addr string
 	i    int
-
-	mu sync.Mutex
 }
 
 func (b *assertingBackend) String() string {
 	return fmt.Sprintf("backend%d", b.i)
 }
 
-func (b *assertingBackend) GetConnection(ctx context.Context, fullMethodName string) (context.Context, *grpc.ClientConn, error) {
+func (b *assertingBackend) GetConnection(ctx context.Context, _ string) (context.Context, *grpc.ClientConn, error) {
 	md, _ := metadata.FromIncomingContext(ctx)
 	// Explicitly copy the metadata, otherwise the tests will fail.
 	outCtx := metadata.NewOutgoingContext(ctx, md.Copy())
 
-	if b.addr == "fail" {
+	if b.conn == nil {
 		return ctx, nil, status.Error(codes.Unavailable, "backend connection failed")
 	}
 
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if b.conn != nil {
-		return outCtx, b.conn, nil
-	}
-
-	var err error
-	b.conn, err = grpc.DialContext(ctx, b.addr, grpc.WithInsecure(), grpc.WithCodec(proxy.Codec())) //nolint: staticcheck
-
-	return outCtx, b.conn, err
+	return outCtx, b.conn, nil
 }
 
 func (b *assertingBackend) AppendInfo(streaming bool, resp []byte) ([]byte, error) {
@@ -243,7 +227,7 @@ func (s *ProxyOne2ManySuite) TestPingEmptyCarriesClientMetadata() {
 	require.NoError(s.T(), err, "PingEmpty should succeed without errors")
 
 	expectedUpstreams := map[string]struct{}{}
-	for i := 0; i < numUpstreams; i++ {
+	for i := range numUpstreams {
 		expectedUpstreams[fmt.Sprintf("server%d", i)] = struct{}{}
 	}
 
@@ -263,7 +247,7 @@ func (s *ProxyOne2ManySuite) TestPingEmptyCarriesClientMetadata() {
 }
 
 func (s *ProxyOne2ManySuite) TestPingEmpty_StressTest() {
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		s.TestPingEmptyCarriesClientMetadata()
 	}
 }
@@ -374,7 +358,7 @@ func (s *ProxyOne2ManySuite) TestPingStreamErrorPropagatesAppError() {
 	stream, err := s.testClient.PingStreamError(s.ctx)
 	s.Require().NoError(err, "error should be encapsulated in the response")
 
-	for j := 0; j < numUpstreams; j++ {
+	for range numUpstreams {
 		var resp *pb.MultiPingResponse
 
 		resp, err = stream.Recv()
@@ -421,17 +405,17 @@ func (s *ProxyOne2ManySuite) TestPingStream_FullDuplexWorks() {
 	stream, err := s.testClient.PingStream(s.ctx)
 	require.NoError(s.T(), err, "PingStream request should be successful.")
 
-	for i := 0; i < countListResponses; i++ {
+	for i := range countListResponses {
 		ping := &pb.PingRequest{Value: fmt.Sprintf("foo:%d", i)}
 		require.NoError(s.T(), stream.Send(ping), "sending to PingStream must not fail")
 
 		expectedUpstreams := map[string]struct{}{}
-		for j := 0; j < numUpstreams; j++ {
+		for j := range numUpstreams {
 			expectedUpstreams[fmt.Sprintf("server%d", j)] = struct{}{}
 		}
 
 		// each upstream should send back response
-		for j := 0; j < numUpstreams; j++ {
+		for range numUpstreams {
 			var resp *pb.MultiPingResponse
 			resp, err = stream.Recv()
 			s.Require().NoError(err)
@@ -452,6 +436,7 @@ func (s *ProxyOne2ManySuite) TestPingStream_FullDuplexWorks() {
 			assert.Contains(s.T(), headerMd, serverHeaderMdKey, "PingStream response headers user contain metadata")
 		}
 	}
+
 	require.NoError(s.T(), stream.CloseSend(), "no error on close send")
 	_, err = stream.Recv()
 	require.Equal(s.T(), io.EOF, err, "stream should close with io.EOF, meaning OK")
@@ -469,13 +454,14 @@ func (s *ProxyOne2ManySuite) TestPingStream_FullDuplexConcurrent() {
 	errCh := make(chan error, 2)
 
 	expectedUpstreams := map[string]int32{}
-	for j := 0; j < numUpstreams; j++ {
+
+	for j := range numUpstreams {
 		expectedUpstreams[fmt.Sprintf("server%d", j)] = 0
 	}
 
 	go func() {
 		errCh <- func() error {
-			for i := 0; i < countListResponses; i++ {
+			for i := range countListResponses {
 				ping := &pb.PingRequest{Value: fmt.Sprintf("foo:%d", i)}
 				if err = stream.Send(ping); err != nil {
 					return err
@@ -488,7 +474,7 @@ func (s *ProxyOne2ManySuite) TestPingStream_FullDuplexConcurrent() {
 
 	go func() {
 		errCh <- func() error {
-			for i := 0; i < countListResponses*numUpstreams; i++ {
+			for range countListResponses * numUpstreams {
 				var resp *pb.MultiPingResponse
 
 				resp, err = stream.Recv()
@@ -531,7 +517,7 @@ func (s *ProxyOne2ManySuite) TestPingStream_FullDuplexConcurrent() {
 }
 
 func (s *ProxyOne2ManySuite) TestPingStream_StressTest() {
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		s.TestPingStream_FullDuplexWorks()
 	}
 }
@@ -572,19 +558,27 @@ func (s *ProxyOne2ManySuite) SetupSuite() {
 	backends := make([]*assertingBackend, numUpstreams)
 
 	for i := range backends {
+		var conn *grpc.ClientConn
+		conn, err = grpc.NewClient(
+			s.serverListeners[i].Addr().String(),
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithDefaultCallOptions(grpc.ForceCodecV2(proxy.Codec())),
+		)
+		require.NoError(s.T(), err)
+
 		backends[i] = &assertingBackend{
+			conn: conn,
 			i:    i,
-			addr: s.serverListeners[i].Addr().String(),
 		}
 	}
 
 	failingBackend := &assertingBackend{
+		conn: nil,
 		i:    -1,
-		addr: "fail",
 	}
 
 	// Setup of the proxy's Director.
-	director := func(ctx context.Context, fullName string) (proxy.Mode, []proxy.Backend, error) {
+	director := func(ctx context.Context, _ string) (proxy.Mode, []proxy.Backend, error) {
 		var targets []int
 
 		md, ok := metadata.FromIncomingContext(ctx)
@@ -627,7 +621,7 @@ func (s *ProxyOne2ManySuite) SetupSuite() {
 	}
 
 	s.proxy = grpc.NewServer(
-		grpc.CustomCodec(proxy.Codec()), //nolint: staticcheck
+		grpc.ForceServerCodecV2(proxy.Codec()),
 		grpc.UnknownServiceHandler(proxy.TransparentHandler(director)),
 	)
 	// Ping handler is handled as an explicit registration and not as a TransparentHandler.
@@ -652,10 +646,7 @@ func (s *ProxyOne2ManySuite) SetupSuite() {
 		s.proxy.Serve(s.proxyListener) //nolint: errcheck
 	}()
 
-	ctx, ctxCancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer ctxCancel()
-
-	clientConn, err := grpc.DialContext(ctx, strings.Replace(s.proxyListener.Addr().String(), "127.0.0.1", "localhost", 1), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	clientConn, err := grpc.NewClient(strings.Replace(s.proxyListener.Addr().String(), "127.0.0.1", "localhost", 1), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(s.T(), err, "must not error on deferred client Dial")
 	s.testClient = pb.NewMultiServiceClient(clientConn)
 }
@@ -695,5 +686,5 @@ func TestProxyOne2ManySuite(t *testing.T) {
 }
 
 func init() {
-	grpclog.SetLogger(log.New(os.Stderr, "grpc: ", log.LstdFlags)) //nolint: staticcheck
+	grpclog.SetLoggerV2(grpclog.NewLoggerV2(os.Stderr, os.Stderr, os.Stderr))
 }

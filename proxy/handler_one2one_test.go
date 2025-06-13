@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jhump/grpctunnel"
+	"github.com/jhump/grpctunnel/tunnelpb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
@@ -63,7 +65,7 @@ func (s *assertingService) Ping(ctx context.Context, ping *pb.PingRequest) (*pb.
 	return &pb.PingResponse{Value: ping.Value, Counter: 42}, nil
 }
 
-func (s *assertingService) PingError(ctx context.Context, ping *pb.PingRequest) (*pb.Empty, error) {
+func (s *assertingService) PingError(context.Context, *pb.PingRequest) (*pb.Empty, error) {
 	return nil, status.Errorf(codes.FailedPrecondition, "Userspace error.")
 }
 
@@ -71,7 +73,7 @@ func (s *assertingService) PingList(ping *pb.PingRequest, stream pb.TestService_
 	// Send user trailers and headers.
 	stream.SendHeader(metadata.Pairs(serverHeaderMdKey, "I like turtles.")) //nolint: errcheck
 
-	for i := 0; i < countListResponses; i++ {
+	for i := range countListResponses {
 		stream.Send(&pb.PingResponse{Value: ping.Value, Counter: int32(i)}) //nolint: errcheck
 	}
 
@@ -119,8 +121,12 @@ type ProxyOne2OneSuite struct {
 	proxy            *grpc.Server
 	serverClientConn *grpc.ClientConn
 
-	client     *grpc.ClientConn
-	testClient pb.TestServiceClient
+	tunnelHandler  *grpctunnel.TunnelServiceHandler
+	tunnelOpenedCh chan struct{}
+
+	client       *grpc.ClientConn
+	testClient   pb.TestServiceClient
+	tunnelClient tunnelpb.TunnelServiceClient
 
 	ctx       context.Context //nolint:containedctx
 	ctxCancel context.CancelFunc
@@ -142,16 +148,20 @@ func (s *ProxyOne2OneSuite) TestPingEmptyCarriesClientMetadata() {
 }
 
 func (s *ProxyOne2OneSuite) TestPingEmpty_StressTest() {
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		s.TestPingEmptyCarriesClientMetadata()
 	}
 }
 
 func (s *ProxyOne2OneSuite) TestPingCarriesServerHeadersAndTrailers() {
+	s.testPingCarriesServerHeadersAndTrailers(s.testClient)
+}
+
+func (s *ProxyOne2OneSuite) testPingCarriesServerHeadersAndTrailers(client pb.TestServiceClient) {
 	headerMd := make(metadata.MD)
 	trailerMd := make(metadata.MD)
 	// This is an awkward calling convention... but meh.
-	out, err := s.testClient.Ping(s.ctx, &pb.PingRequest{Value: "foo"}, grpc.Header(&headerMd), grpc.Trailer(&trailerMd))
+	out, err := client.Ping(s.ctx, &pb.PingRequest{Value: "foo"}, grpc.Header(&headerMd), grpc.Trailer(&trailerMd))
 	require.NoError(s.T(), err, "Ping should succeed without errors")
 	require.True(s.T(), proto.Equal(&pb.PingResponse{Value: "foo", Counter: 42}, out))
 	assert.Contains(s.T(), headerMd, serverHeaderMdKey, "server response headers must contain server data")
@@ -159,7 +169,11 @@ func (s *ProxyOne2OneSuite) TestPingCarriesServerHeadersAndTrailers() {
 }
 
 func (s *ProxyOne2OneSuite) TestPingErrorPropagatesAppError() {
-	_, err := s.testClient.PingError(s.ctx, &pb.PingRequest{Value: "foo"})
+	s.testPingErrorPropagatesAppError(s.testClient)
+}
+
+func (s *ProxyOne2OneSuite) testPingErrorPropagatesAppError(client pb.TestServiceClient) {
+	_, err := client.PingError(s.ctx, &pb.PingRequest{Value: "foo"})
 	require.Error(s.T(), err, "PingError should never succeed")
 	assert.Equal(s.T(), codes.FailedPrecondition, status.Code(err))
 	assert.Equal(s.T(), "Userspace error.", status.Convert(err).Message())
@@ -175,10 +189,38 @@ func (s *ProxyOne2OneSuite) TestDirectorErrorIsPropagated() {
 }
 
 func (s *ProxyOne2OneSuite) TestPingStream_FullDuplexWorks() {
-	stream, err := s.testClient.PingStream(s.ctx)
+	s.testStream(s.testClient)
+}
+
+func (s *ProxyOne2OneSuite) TestReverseTunnel() {
+	channelServer := grpctunnel.NewReverseTunnelServer(s.tunnelClient)
+
+	pb.RegisterTestServiceServer(channelServer, &assertingService{t: s.T()})
+
+	go func() {
+		channelServer.Serve(s.ctx) //nolint:errcheck // we are not interested in the error here
+	}()
+
+	// wait for the tunnel to open
+	select {
+	case <-s.ctx.Done():
+		s.FailNow("timeout waiting for tunnel to open")
+	case <-s.tunnelOpenedCh:
+	}
+
+	fakeConn := s.tunnelHandler.KeyAsChannel("asdf")
+	client := pb.NewTestServiceClient(fakeConn)
+
+	s.testPingCarriesServerHeadersAndTrailers(client)
+	s.testPingErrorPropagatesAppError(client)
+	s.testStream(client)
+}
+
+func (s *ProxyOne2OneSuite) testStream(client pb.TestServiceClient) {
+	stream, err := client.PingStream(s.ctx)
 	require.NoError(s.T(), err, "PingStream request should be successful.")
 
-	for i := 0; i < countListResponses; i++ {
+	for i := range countListResponses {
 		ping := &pb.PingRequest{Value: fmt.Sprintf("foo:%d", i)}
 		require.NoError(s.T(), stream.Send(ping), "sending to PingStream must not fail")
 
@@ -199,6 +241,7 @@ func (s *ProxyOne2OneSuite) TestPingStream_FullDuplexWorks() {
 
 		assert.EqualValues(s.T(), i, resp.Counter, "ping roundtrip must succeed with the correct id")
 	}
+
 	require.NoError(s.T(), stream.CloseSend(), "no error on close send")
 	_, err = stream.Recv()
 	require.Equal(s.T(), io.EOF, err, "stream should close with io.EOF, meaining OK")
@@ -208,7 +251,7 @@ func (s *ProxyOne2OneSuite) TestPingStream_FullDuplexWorks() {
 }
 
 func (s *ProxyOne2OneSuite) TestPingStream_StressTest() {
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		s.TestPingStream_FullDuplexWorks()
 	}
 }
@@ -224,11 +267,40 @@ func (s *ProxyOne2OneSuite) SetupSuite() {
 	s.server = grpc.NewServer()
 	pb.RegisterTestServiceServer(s.server, &assertingService{t: s.T()})
 
+	s.tunnelOpenedCh = make(chan struct{})
+
+	s.tunnelHandler = grpctunnel.NewTunnelServiceHandler(
+		grpctunnel.TunnelServiceHandlerOptions{
+			OnReverseTunnelOpen: func(grpctunnel.TunnelChannel) {
+				s.T().Logf("[tunnel] open reverse tunnel")
+			},
+			OnReverseTunnelClose: func(grpctunnel.TunnelChannel) {
+				s.T().Logf("[tunnel] close reverse tunnel")
+			},
+			AffinityKey: func(grpctunnel.TunnelChannel) any {
+				s.T().Logf("[tunnel] get affinity key")
+
+				select {
+				case <-s.ctx.Done():
+					return "fail"
+				case s.tunnelOpenedCh <- struct{}{}:
+					return "asdf"
+				}
+			},
+		},
+	)
+
+	tunnelpb.RegisterTunnelServiceServer(s.server, s.tunnelHandler.Service())
+
 	// Setup of the proxy's Director.
-	s.serverClientConn, err = grpc.Dial(s.serverListener.Addr().String(), grpc.WithInsecure(), grpc.WithCodec(proxy.Codec())) //nolint: staticcheck
+	s.serverClientConn, err = grpc.NewClient(
+		s.serverListener.Addr().String(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.ForceCodecV2(proxy.Codec())),
+	)
 	require.NoError(s.T(), err, "must not error on deferred client Dial")
 
-	director := func(ctx context.Context, fullName string) (proxy.Mode, []proxy.Backend, error) {
+	director := func(ctx context.Context, _ string) (proxy.Mode, []proxy.Backend, error) {
 		md, ok := metadata.FromIncomingContext(ctx)
 		if ok {
 			if _, exists := md[rejectingMdKey]; exists {
@@ -250,7 +322,7 @@ func (s *ProxyOne2OneSuite) SetupSuite() {
 	}
 
 	s.proxy = grpc.NewServer(
-		grpc.CustomCodec(proxy.Codec()), //nolint: staticcheck
+		grpc.ForceServerCodecV2(proxy.Codec()),
 		grpc.UnknownServiceHandler(proxy.TransparentHandler(director)),
 	)
 
@@ -273,12 +345,13 @@ func (s *ProxyOne2OneSuite) SetupSuite() {
 		s.proxy.Serve(s.proxyListener) //nolint: errcheck
 	}()
 
-	ctx, ctxCancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer ctxCancel()
-
-	clientConn, err := grpc.DialContext(ctx, strings.Replace(s.proxyListener.Addr().String(), "127.0.0.1", "localhost", 1), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	clientConn, err := grpc.NewClient(
+		strings.Replace(s.proxyListener.Addr().String(), "127.0.0.1", "localhost", 1),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
 	require.NoError(s.T(), err, "must not error on deferred client Dial")
 	s.testClient = pb.NewTestServiceClient(clientConn)
+	s.tunnelClient = tunnelpb.NewTunnelServiceClient(clientConn)
 }
 
 func (s *ProxyOne2OneSuite) TearDownSuite() {

@@ -41,7 +41,7 @@ type backendConnection struct {
 // handler is where the real magic of proxying happens.
 // It is invoked like any gRPC server stream and uses the gRPC server framing to get and receive bytes from the wire,
 // forwarding it to a ClientStream established against the relevant ClientConn.
-func (s *handler) handler(srv interface{}, serverStream grpc.ServerStream) error {
+func (s *handler) handler(_ any, serverStream grpc.ServerStream) error {
 	// little bit of gRPC internals never hurt anyone
 	fullMethodName, ok := grpc.MethodFromServerStream(serverStream)
 	if !ok {
